@@ -5,16 +5,21 @@ use ratatui::prelude::*;
 /// Computed once per frame by [`calculate`] so that rendering and mouse
 /// hit-testing always agree on widget positions.
 pub struct LayoutRects {
+    // Main panels
     pub left_panel: Rect,
     pub info_area: Rect,
+    // Input fields (main panel)
     pub input_port: Rect,
     pub input_manualip: Rect,
     pub bitrate_group: Rect,
     pub fps_group: Rect,
     pub maxsize_group: Rect,
+    // Action buttons (main panel)
     pub btn_0: Rect,
     pub btn_1: Rect,
     pub btn_2: Rect,
+    pub btn_3: Rect,
+    // Camera panel
     pub cam_zoom: Rect,
     pub cam_fps: Rect,
     pub cam_codec: Rect,
@@ -23,6 +28,12 @@ pub struct LayoutRects {
     pub cam_nowindow: Rect,
     pub cam_launch: Rect,
     pub cam_preview: Rect,
+        // Status bar
+        pub status_bar: Rect,
+        pub status_help: Rect,
+        pub status_logs: Rect,
+        pub status_lang: Rect,
+        pub status_loader: Rect,
 }
 
 /// Returns `true` when the point `(x, y)` falls inside `rect`.
@@ -53,11 +64,25 @@ pub fn preset_click(rect: Rect, x: u16, y: u16, n: u16) -> Option<usize> {
 
 /// Build the full set of UI rectangles for the given terminal `area`.
 ///
-/// The main content always fills the full `area`. Logs are shown in a modal
-/// popup rendered on top, so the layout never shifts.
+/// The main content fills `area` minus the bottom status bar row.
+/// Logs and help are shown as modal popups rendered on top.
+#[allow(clippy::too_many_lines)]
 pub fn calculate(area: Rect) -> LayoutRects {
+    let main_area = Rect {
+        x: 0,
+        y: 0,
+        width: area.width,
+        height: area.height.saturating_sub(1),
+    };
+    let status_bar = Rect {
+        x: 0,
+        y: area.height.saturating_sub(1),
+        width: area.width,
+        height: 1,
+    };
+
     let panels = Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)])
-        .split(area);
+        .split(main_area);
     let left_panel = panels[0];
     let right_panel = panels[1];
 
@@ -97,9 +122,10 @@ pub fn calculate(area: Rect) -> LayoutRects {
     .split(input_rows[1]);
 
     let btn_w = Layout::horizontal([
-        Constraint::Ratio(1, 3),
-        Constraint::Ratio(1, 3),
-        Constraint::Ratio(1, 3),
+        Constraint::Percentage(25),
+        Constraint::Percentage(25),
+        Constraint::Percentage(25),
+        Constraint::Percentage(25),
     ])
     .split(main_parts[1]);
 
@@ -126,6 +152,17 @@ pub fn calculate(area: Rect) -> LayoutRects {
     ])
     .split(cam_blocks[2]);
 
+    // ── Status bar sections ─────────────────────────────────────────
+    let status_cols = Layout::horizontal([
+        Constraint::Length(8),   // " Help ? "
+        Constraint::Length(1),   // "│"
+        Constraint::Length(8),   // " Logs L "
+        Constraint::Length(1),   // "│"
+        Constraint::Min(0),      // filler
+        Constraint::Length(4),   // " EN "/" ES "
+    ])
+    .split(status_bar);
+
     LayoutRects {
         left_panel,
         info_area,
@@ -137,6 +174,7 @@ pub fn calculate(area: Rect) -> LayoutRects {
         btn_0: btn_w[0],
         btn_1: btn_w[1],
         btn_2: btn_w[2],
+        btn_3: btn_w[3],
         cam_zoom: cam_upper[0],
         cam_fps: cam_upper[1],
         cam_codec: cam_upper[2],
@@ -145,6 +183,11 @@ pub fn calculate(area: Rect) -> LayoutRects {
         cam_nowindow: cam_mid[1],
         cam_launch: cam_blocks[3],
         cam_preview: cam_blocks[4],
+        status_bar,
+        status_help: status_cols[0],
+        status_logs: status_cols[2],
+        status_lang: status_cols[5],
+        status_loader: status_cols[4],
     }
 }
 
@@ -205,5 +248,10 @@ mod tests {
         assert!(ly.btn_0.width > 0);
         assert!(ly.btn_1.x != ly.btn_0.x);
         assert!(ly.btn_2.x != ly.btn_1.x);
+        assert!(ly.btn_3.x != ly.btn_2.x);
+        assert_eq!(ly.status_bar.height, 1);
+        assert!(ly.status_help.width > 0);
+        assert!(ly.status_logs.width > 0);
+        assert!(ly.status_lang.width > 0);
     }
 }

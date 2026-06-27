@@ -76,17 +76,17 @@ fn run(cmd: &str, args: &[&str]) -> Result<()> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .context(format!("Error ejecutando {cmd}"))?
+        .context(format!("Error executing {cmd}"))?
         .success()
         .then_some(())
-        .context(format!("{cmd} terminó con error"))
+        .context(format!("{cmd} finished with error"))
 }
 
 fn output(cmd: &str, args: &[&str]) -> Result<Output> {
     Command::new(cmd)
         .args(args)
         .output()
-        .context(format!("Error ejecutando {cmd}"))
+        .context(format!("Error running {cmd}"))
 }
 
 fn get_prop(serial: &str, prop: &str) -> Result<String> {
@@ -103,11 +103,11 @@ fn get_ip_for_iface(serial: &str, iface: &str) -> Result<Option<String>> {
             let ip = line
                 .split_whitespace()
                 .nth(1)
-                .context("formato inesperado en ip addr show")?;
+                .context("unexpected format in ip addr show")?;
             return Ok(Some(
                 ip.split('/')
                     .next()
-                    .context("formato inesperado en ip addr show")?
+                    .context("unexpected format in ip addr show")?
                     .to_string(),
             ));
         }
