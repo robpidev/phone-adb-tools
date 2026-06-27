@@ -1,9 +1,12 @@
-use ratatui::{prelude::*, widgets::*};
+use ratatui::{
+    prelude::*,
+    widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap},
+};
 
-use crate::adb;
-use crate::app::{App, ConnectionType, EditMode};
+use crate::app::{App, ConnectionType, EditMode, Panel};
+use crate::layout;
 
-fn log_style(text: &str) -> Style {
+pub fn log_style(text: &str) -> Style {
     if text.starts_with("\u{f00c}") {
         Style::default().fg(Color::Green)
     } else if text.starts_with("\u{f00d}") {
@@ -30,17 +33,12 @@ fn render_help_popup(frame: &mut Frame, area: Rect, app: &App) {
     ])
     .split(popup_area)[1];
 
-    let adb_ok = adb::check_adb();
-    let scrcpy_ok = std::process::Command::new("scrcpy")
-        .arg("--version")
-        .output()
-        .is_ok();
-    let adb_status = if adb_ok {
+    let adb_status = if app.adb_available {
         "\u{f00c} Instalado"
     } else {
         "\u{f00d} No encontrado"
     };
-    let scrcpy_status = if scrcpy_ok {
+    let scrcpy_status = if app.scrcpy_available {
         "\u{f00c} Instalado"
     } else {
         "\u{f00d} No encontrado"
@@ -101,6 +99,9 @@ fn render_help_popup(frame: &mut Frame, area: Rect, app: &App) {
         Line::from("   Esc      Cancelar edición"),
         Line::from("   p/s/f/m  Puerto / bitrate / fps / max"),
         Line::from("   d        Desconectar"),
+        Line::from("   c        Cámara (tab cámara)"),
+        Line::from("   1        Volver a pantalla principal"),
+        Line::from("   L        Mostrar/ocultar logs"),
         Line::from("   ?        Mostrar/ocultar ayuda"),
         Line::from(""),
         Line::from(vec![Span::styled(
@@ -122,6 +123,50 @@ fn render_help_popup(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(popup, popup_area);
 }
 
+fn render_logs_modal(frame: &mut Frame, area: Rect, app: &App) {
+    let popup_area = Layout::vertical([
+        Constraint::Percentage(15),
+        Constraint::Percentage(70),
+        Constraint::Percentage(15),
+    ])
+    .split(area)[1];
+
+    let popup_area = Layout::horizontal([
+        Constraint::Percentage(15),
+        Constraint::Percentage(70),
+        Constraint::Percentage(15),
+    ])
+    .split(popup_area)[1];
+
+    let inner_height = popup_area.height.saturating_sub(2);
+    let max_lines = inner_height as usize;
+
+    let logs: Vec<Line> = app
+        .logs
+        .iter()
+        .rev()
+        .take(max_lines)
+        .rev()
+        .map(|l| Line::from(vec![Span::styled(l.clone(), log_style(l))]))
+        .collect();
+
+    let log_widget = Paragraph::new(logs)
+        .block(
+            Block::bordered()
+                .border_set(symbols::border::ROUNDED)
+                .border_style(Style::default().fg(Color::Blue))
+                .title(" Logs ")
+                .title_style(
+                    Style::default()
+                        .fg(Color::Blue)
+                        .add_modifier(Modifier::BOLD),
+                ),
+        );
+
+    frame.render_widget(Clear, popup_area);
+    frame.render_widget(log_widget, popup_area);
+}
+
 fn render_input_box(
     frame: &mut Frame,
     area: Rect,
@@ -140,11 +185,11 @@ fn render_input_box(
     };
 
     let display = if is_editing {
-        format!(" {}_ ", value)
+        format!(" {value}_ ")
     } else if value.is_empty() && is_empty_ok {
         " (vacío) ".to_string()
     } else {
-        format!(" {} ", value)
+        format!(" {value} ")
     };
 
     let inner = Paragraph::new(display)
@@ -182,6 +227,7 @@ fn render_button(frame: &mut Frame, area: Rect, label: &str, icon: &str, is_focu
     frame.render_widget(inner, area);
 }
 
+#[allow(clippy::cast_possible_truncation)]
 fn render_preset_block(
     frame: &mut Frame,
     area: Rect,
@@ -206,7 +252,7 @@ fn render_preset_block(
         .title_style(border_style);
 
     if is_edit {
-        let display = format!(" {}_ ", buffer);
+        let display = format!(" {buffer}_ ");
         let para = Paragraph::new(display).block(block);
         frame.render_widget(para, area);
         return;
@@ -235,26 +281,14 @@ fn render_preset_block(
         } else {
             Style::default().fg(Color::White)
         };
-        let para = Paragraph::new(format!(" {} ", label))
+        let para = Paragraph::new(format!(" {label} "))
             .style(style)
             .alignment(Alignment::Center);
         frame.render_widget(para, btn_area);
     }
 }
 
-pub fn ui(frame: &mut Frame, app: &App) {
-    let area = frame.area();
-
-    let sections = Layout::vertical([Constraint::Percentage(72), Constraint::Percentage(28)])
-        .split(area);
-    let top_section = sections[0];
-    let logs_section = sections[1];
-
-    let panels = Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)])
-        .split(top_section);
-    let left_panel = panels[0];
-    let right_panel = panels[1];
-
+fn render_device_list(frame: &mut Frame, area: Rect, app: &App) {
     let items: Vec<ListItem> = app
         .devices
         .iter()
@@ -295,15 +329,46 @@ pub fn ui(frame: &mut Frame, app: &App) {
                 .add_modifier(Modifier::BOLD),
         );
 
-    frame.render_stateful_widget(dev_list, left_panel, &mut state);
+    frame.render_stateful_widget(dev_list, area, &mut state);
+}
 
-    let right_layout =
-        Layout::vertical([Constraint::Length(6), Constraint::Min(6), Constraint::Length(3)])
-            .split(right_panel);
-    let info_area = right_layout[0];
-    let inputs_area = right_layout[1];
-    let actions_area = right_layout[2];
+fn render_camera_list(frame: &mut Frame, area: Rect, app: &App) {
+    let items: Vec<ListItem> = app
+        .camera
+        .available
+        .iter()
+        .map(|c| {
+            ListItem::new(format!("{} {} ({})", c.id, c.name, c.max_resolution))
+        })
+        .collect();
 
+    let mut state = ListState::default();
+    state.select(Some(app.camera.selected_camera));
+
+    let cam_list = List::new(items)
+        .block(
+            Block::bordered()
+                .border_set(symbols::border::ROUNDED)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(" \u{f030} Cámaras ")
+                .title_style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+        )
+        .highlight_symbol(">> ")
+        .highlight_style(
+            Style::default()
+                .fg(Color::Green)
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        );
+
+    frame.render_stateful_widget(cam_list, area, &mut state);
+}
+
+fn render_info_panel(frame: &mut Frame, area: Rect, app: &App) {
     let info_block = Block::bordered()
         .border_set(symbols::border::ROUNDED)
         .border_style(Style::default().fg(Color::Cyan))
@@ -348,25 +413,17 @@ pub fn ui(frame: &mut Frame, app: &App) {
     };
 
     let info_para = Paragraph::new(info_lines).block(info_block);
-    frame.render_widget(info_para, info_area);
+    frame.render_widget(info_para, area);
+}
 
-    let input_rows = Layout::vertical([
-        Constraint::Ratio(1, 3),
-        Constraint::Ratio(1, 3),
-        Constraint::Ratio(1, 3),
-    ])
-    .split(inputs_area);
-
-    let row0 = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(input_rows[0]);
-
+fn render_inputs(frame: &mut Frame, ly: &layout::LayoutRects, app: &App) {
     let port_value = if app.edit_mode == EditMode::Port {
         &app.edit_buffer
     } else {
         &app.port.to_string()
     };
     render_input_box(
-        frame, row0[0], "Puerto", port_value,
+        frame, ly.input_port, "Puerto", port_value,
         app.center_focus == 0, app.edit_mode == EditMode::Port, false,
     );
 
@@ -376,12 +433,9 @@ pub fn ui(frame: &mut Frame, app: &App) {
         &app.manual_ip
     };
     render_input_box(
-        frame, row0[1], "IP manual", ip_value,
+        frame, ly.input_manualip, "IP manual", ip_value,
         app.center_focus == 1, app.edit_mode == EditMode::ManualIp, true,
     );
-
-    let row1 = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(input_rows[1]);
 
     let bitrate_buffer = if app.edit_mode == EditMode::Bitrate {
         &app.edit_buffer
@@ -389,7 +443,7 @@ pub fn ui(frame: &mut Frame, app: &App) {
         ""
     };
     render_preset_block(
-        frame, row1[0], "Bitrate",
+        frame, ly.bitrate_group, "Bitrate",
         &[
             ("4M", app.quality.bitrate == "4M"),
             ("8M", app.quality.bitrate == "8M"),
@@ -405,7 +459,7 @@ pub fn ui(frame: &mut Frame, app: &App) {
         ""
     };
     render_preset_block(
-        frame, row1[1], "FPS",
+        frame, ly.fps_group, "FPS",
         &[
             ("30", app.quality.max_fps == 30),
             ("60", app.quality.max_fps == 60),
@@ -420,7 +474,7 @@ pub fn ui(frame: &mut Frame, app: &App) {
         ""
     };
     render_preset_block(
-        frame, input_rows[2], "Max size",
+        frame, ly.maxsize_group, "Max size",
         &[
             ("720", app.quality.max_size == 720),
             ("1080", app.quality.max_size == 1080),
@@ -429,19 +483,11 @@ pub fn ui(frame: &mut Frame, app: &App) {
         ],
         app.center_focus == 4, maxsize_buffer, app.edit_mode == EditMode::MaxSize,
     );
+}
 
-    let btn_w = Layout::horizontal([
-        Constraint::Ratio(1, 3),
-        Constraint::Ratio(1, 3),
-        Constraint::Ratio(1, 3),
-    ])
-    .split(actions_area);
-
-    let has_dev = app.selected_info().is_some();
-    let is_usb = app
-        .selected_info()
-        .map(|d| d.connection == ConnectionType::Usb)
-        .unwrap_or(false);
+fn render_actions(frame: &mut Frame, ly: &layout::LayoutRects, app: &App) {
+    let has_dev = app.has_selected();
+    let is_usb = app.is_selected_usb();
 
     let (label0, icon0, f0) = if has_dev {
         ("Lanzar scrcpy", "\u{f17b}", app.center_focus == 5)
@@ -456,32 +502,109 @@ pub fn ui(frame: &mut Frame, app: &App) {
         ("---", "", false)
     };
 
-    render_button(frame, btn_w[0], label0, icon0, f0);
-    render_button(frame, btn_w[1], label1, icon1, f1);
-    render_button(frame, btn_w[2], "WiFi manual", "\u{f1eb}", app.center_focus == 7);
+    render_button(frame, ly.btn_0, label0, icon0, f0);
+    render_button(frame, ly.btn_1, label1, icon1, f1);
+    render_button(frame, ly.btn_2, "WiFi manual", "\u{f1eb}", app.center_focus == 7);
+}
 
-    let logs: Vec<Line> = app
-        .logs
-        .iter()
-        .rev()
-        .take(12)
-        .rev()
-        .map(|l| Line::from(vec![Span::styled(l.clone(), log_style(l))]))
-        .collect();
+fn render_camera_panel(frame: &mut Frame, ly: &layout::LayoutRects, app: &App) {
+    render_info_panel(frame, ly.info_area, app);
 
-    let log_widget = Paragraph::new(logs).block(
-        Block::bordered()
-            .border_set(symbols::border::ROUNDED)
-            .border_style(Style::default().fg(Color::Blue))
-            .title(" Logs ")
-            .title_style(
-                Style::default()
-                    .fg(Color::Blue)
-                    .add_modifier(Modifier::BOLD),
-            ),
+    let zoom_value = if app.edit_mode == EditMode::CameraZoom {
+        &app.edit_buffer
+    } else {
+        &app.camera.camera_zoom
+    };
+    render_input_box(
+        frame, ly.cam_zoom, "Zoom", zoom_value,
+        app.center_focus == 0, app.edit_mode == EditMode::CameraZoom, false,
     );
 
-    frame.render_widget(log_widget, logs_section);
+    let fps_value = if app.edit_mode == EditMode::CameraFps {
+        &app.edit_buffer
+    } else {
+        &app.camera.camera_fps
+    };
+    render_input_box(
+        frame, ly.cam_fps, "FPS", fps_value,
+        app.center_focus == 1, app.edit_mode == EditMode::CameraFps, false,
+    );
+
+    render_preset_block(
+        frame, ly.cam_codec, "Codec",
+        &[
+            ("h264", app.camera.video_codec == "h264"),
+            ("h265", app.camera.video_codec == "h265"),
+        ],
+        app.center_focus == 2, "", false,
+    );
+
+    let presets = app.camera.size_presets();
+    let preset_refs: Vec<(&str, bool)> = presets.iter().enumerate().map(|(i, p)| {
+        (p.as_str(), i == app.camera.selected_size)
+    }).collect();
+    render_preset_block(
+        frame, ly.cam_size, "Tamaño", &preset_refs,
+        app.center_focus == 3, "", false,
+    );
+
+    let v4l2_value = if app.edit_mode == EditMode::CameraV4l2 {
+        &app.edit_buffer
+    } else {
+        &app.camera.v4l2_sink
+    };
+    render_input_box(
+        frame, ly.cam_v4l2, "V4L2", v4l2_value,
+        app.center_focus == 4, app.edit_mode == EditMode::CameraV4l2, false,
+    );
+
+    let nowin_icon = if app.camera.no_window { "\u{f204}" } else { "\u{f205}" };
+    render_button(
+        frame, ly.cam_nowindow, "Sin ventana", nowin_icon,
+        app.center_focus == 5,
+    );
+
+    render_button(
+        frame, ly.cam_launch, "Lanzar cámara", "\u{f030}",
+        app.center_focus == 6,
+    );
+
+    let preview = app.camera_command_preview();
+    if !preview.is_empty() {
+        let preview_para = Paragraph::new(preview)
+            .wrap(Wrap { trim: true })
+            .style(Style::default().fg(Color::DarkGray))
+            .block(
+                Block::bordered()
+                    .border_set(symbols::border::ROUNDED)
+                    .border_style(Style::default().fg(Color::DarkGray))
+                    .title(" Comando ")
+                    .title_style(Style::default().fg(Color::DarkGray)),
+            );
+        frame.render_widget(preview_para, ly.cam_preview);
+    }
+}
+
+pub fn ui(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    let ly = layout::calculate(area);
+
+    match app.panel {
+        Panel::Main => {
+            render_device_list(frame, ly.left_panel, app);
+            render_info_panel(frame, ly.info_area, app);
+            render_inputs(frame, &ly, app);
+            render_actions(frame, &ly, app);
+        }
+        Panel::Camera => {
+            render_camera_list(frame, ly.left_panel, app);
+            render_camera_panel(frame, &ly, app);
+        }
+    }
+
+    if app.show_logs {
+        render_logs_modal(frame, area, app);
+    }
 
     if app.show_help {
         render_help_popup(frame, area, app);
