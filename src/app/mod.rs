@@ -1,112 +1,18 @@
+use std::path::Path;
 use std::sync::mpsc;
 use std::time::Instant;
 
 use crate::adb::{self, AdbClient};
+mod camera;
+#[cfg(test)]
+pub(crate) use camera::parse_camera_list;
+#[cfg(test)]
+pub use crate::types::CameraInfo;
 
-/// How a device is connected to the host.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ConnectionType {
-    Usb,
-    TcpIp,
-}
-
-/// Current active panel.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Panel {
-    Main,
-    Camera,
-}
-
-/// Which input field is currently being edited.
-#[derive(Clone, Copy, PartialEq)]
-pub enum EditMode {
-    None,
-    Port,
-    Bitrate,
-    Fps,
-    MaxSize,
-    ManualIp,
-    CameraZoom,
-    CameraFps,
-    CameraV4l2,
-}
-
-/// State machine for the non-blocking wireless switch.
-#[derive(Debug, Clone, PartialEq)]
-pub enum WirelessState {
-    Idle,
-    WaitingTcpIp {
-        serial: String,
-        attempts: u8,
-        launch_scrcpy: bool,
-    },
-}
-
-/// Information about a connected Android device.
-#[derive(Clone)]
-pub struct DeviceInfo {
-    pub serial: String,
-    pub model: String,
-    pub android_version: String,
-    pub connection: ConnectionType,
-}
-
-/// Configurable scrcpy quality settings.
-#[derive(Clone, Default)]
-pub struct ScrcpyQuality {
-    pub bitrate: String,
-    pub max_size: u16,
-    pub max_fps: u16,
-}
-
-/// Camera information parsed from `scrcpy --list-cameras`.
-#[derive(Clone)]
-pub struct CameraInfo {
-    pub id: String,
-    pub name: String,
-    pub max_resolution: String,
-}
-
-/// Camera-specific scrcpy settings.
-#[derive(Clone)]
-pub struct CameraSettings {
-    pub available: Vec<CameraInfo>,
-    pub selected_camera: usize,
-    pub selected_size: usize,
-    pub camera_zoom: String,
-    pub camera_fps: String,
-    pub video_codec: String,
-    pub v4l2_sink: String,
-    pub no_window: bool,
-}
-
-impl CameraSettings {
-    pub fn selected_camera_info(&self) -> Option<&CameraInfo> {
-        self.available.get(self.selected_camera)
-    }
-
-    pub fn current_size(&self) -> String {
-        let presets = self.size_presets();
-        presets
-            .get(self.selected_size)
-            .cloned()
-            .unwrap_or_else(|| "640x480".to_string())
-    }
-
-    pub fn size_presets(&self) -> Vec<String> {
-        let mut presets = vec![
-            "640x480".to_string(),
-            "1280x720".to_string(),
-            "1920x1080".to_string(),
-        ];
-        if let Some(cam) = self.selected_camera_info()
-            && !presets.contains(&cam.max_resolution)
-        {
-            presets.push(cam.max_resolution.clone());
-        }
-        presets
-    }
-}
+use crate::types::{
+    CameraSettings, ConnectionType, DeviceInfo, EditMode, Lang, Panel,
+    ScrcpyQuality, WirelessState, tr,
+};
 
 /// Main application state and logic.
 pub struct App {
@@ -128,6 +34,10 @@ pub struct App {
     pub show_logs: bool,
     pub adb_available: bool,
     pub scrcpy_available: bool,
+    pub v4l2_available: bool,
+    pub lang: Lang,
+    pub(crate) frame_count: u64,
+    pub(crate) loading: bool,
     adb_client: Box<dyn AdbClient>,
 }
 
@@ -162,11 +72,19 @@ impl App {
             show_logs: false,
             adb_available: false,
             scrcpy_available: false,
+            v4l2_available: Path::new("/dev/video0").exists(),
+            lang: Lang::En,
+            frame_count: 0,
+            loading: false,
             adb_client,
         };
         app.refresh_devices();
         app.refresh_tool_checks();
         app
+    }
+
+    pub(crate) fn tr(&self, es: &'static str, en: &'static str) -> &'static str {
+        tr(self.lang, es, en)
     }
 
     /// Append a log message (capped at 100 entries) and update status.
@@ -183,6 +101,10 @@ impl App {
 
     pub fn log_err(&mut self, msg: impl Into<String>) {
         self.log(format!("\u{f00d} {}", msg.into()));
+    }
+
+    pub fn toggle_lang(&mut self) {
+        self.lang.toggle();
     }
 
     pub fn is_selected_wifi(&self) -> bool {
@@ -202,11 +124,13 @@ impl App {
     }
 
     pub fn refresh_devices(&mut self) {
-        self.log("\u{f021} Refrescando dispositivos...");
+        self.loading = true;
+        self.log(format!("\u{f021} {}", self.tr("Refrescando dispositivos...", "Refreshing devices...")));
         let serials = match self.adb_client.list_devices() {
             Ok(s) => s,
             Err(e) => {
-                self.log_err(format!("Error listando dispositivos: {e}"));
+                self.log_err(format!("{}: {e}", self.tr("Error listando dispositivos", "Error listing devices")));
+                self.loading = false;
                 return;
             }
         };
@@ -239,7 +163,13 @@ impl App {
 
         self.last_refresh = Some(Instant::now());
         self.refresh_tool_checks();
-        self.log(format!("Encontrados {} dispositivos", self.devices.len()));
+        self.log(format!(
+            "{} {} {}",
+            self.tr("Encontrados", "Found"),
+            self.devices.len(),
+            self.tr("dispositivos", "devices"),
+        ));
+        self.loading = false;
     }
 
     pub fn connect_selected(&mut self) {
@@ -250,7 +180,7 @@ impl App {
         self.start_wireless(true);
     }
 
-    /// Start wireless switching (non-blocking, for the "Hacer inalámbrico" button).
+    /// Start wireless switching (non-blocking).
     pub fn make_wireless(&mut self) {
         self.start_wireless(false);
     }
@@ -261,20 +191,26 @@ impl App {
         }
 
         let Some(serial) = self.selected_info().map(|d| d.serial.clone()) else {
-            self.log_err("No hay dispositivo seleccionado");
+            self.log_err(self.tr("No hay dispositivo seleccionado", "No device selected"));
             return;
         };
 
         if adb::is_tcpip(&serial) {
-            self.log("El dispositivo ya está en modo WiFi");
+            self.log(self.tr("El dispositivo ya está en modo WiFi", "Device is already in WiFi mode"));
             return;
         }
 
-        self.log(format!("Activando TCP/IP en {serial}"));
+        self.log(format!(
+            "{} {serial}",
+            self.tr("Activando TCP/IP en", "Activating TCP/IP on")
+        ));
         match self.adb_client.set_tcpip(&serial, self.port) {
-            Ok(()) => self.log_ok("TCP/IP activado"),
+            Ok(()) => self.log_ok(self.tr("TCP/IP activado", "TCP/IP activated")),
             Err(e) => {
-                self.log_err(format!("Error activando TCP/IP: {e}"));
+                self.log_err(format!(
+                    "{}: {e}",
+                    self.tr("Error activando TCP/IP", "Error activating TCP/IP")
+                ));
                 return;
             }
         }
@@ -296,7 +232,10 @@ impl App {
         };
 
         if attempts >= 30 {
-            self.log_err(format!("No se pudo obtener IP de {serial}"));
+            self.log_err(format!(
+                "{} {serial}",
+                self.tr("No se pudo obtener IP de", "Could not get IP for")
+            ));
             self.wireless_state = WirelessState::Idle;
             return;
         }
@@ -308,11 +247,14 @@ impl App {
         };
 
         if let Ok(Some(ip)) = self.adb_client.get_phone_ip(&serial) {
-            self.log_ok(format!("IP detectada: {ip}"));
+            self.log_ok(format!(
+                "{}: {ip}",
+                self.tr("IP detectada", "IP detected")
+            ));
             let target = format!("{ip}:{}", self.port);
             match self.adb_client.connect_to(&target) {
                 Ok(()) => {
-                    self.log_ok("Conectado por WiFi");
+                    self.log_ok(self.tr("Conectado por WiFi", "Connected via WiFi"));
                     self.refresh_devices();
                     self.wireless_state = WirelessState::Idle;
                     if launch_scrcpy {
@@ -320,7 +262,10 @@ impl App {
                     }
                 }
                 Err(e) => {
-                    self.log_err(format!("Error conectando por WiFi: {e}"));
+                    self.log_err(format!(
+                        "{}: {e}",
+                        self.tr("Error conectando por WiFi", "Error connecting via WiFi")
+                    ));
                     self.wireless_state = WirelessState::Idle;
                 }
             }
@@ -329,11 +274,11 @@ impl App {
 
     pub fn launch_scrcpy(&mut self) {
         let Some(serial) = self.selected_info().map(|d| d.serial.clone()) else {
-            self.log_err("No hay dispositivo seleccionado");
+            self.log_err(self.tr("No hay dispositivo seleccionado", "No device selected"));
             return;
         };
 
-        self.log("Lanzando scrcpy...");
+        self.log(self.tr("Lanzando scrcpy...", "Launching scrcpy..."));
         let mut cmd = std::process::Command::new("scrcpy");
         cmd.args(["-s", &serial]);
         if !self.quality.bitrate.is_empty() {
@@ -352,7 +297,7 @@ impl App {
         match cmd.spawn() {
             Ok(mut child) => {
                 let Some(stderr) = child.stderr.take() else {
-                    self.log_err("No se pudo capturar stderr de scrcpy");
+                    self.log_err(self.tr("No se pudo capturar stderr de scrcpy", "Could not capture scrcpy stderr"));
                     return;
                 };
                 let (tx, rx) = mpsc::channel();
@@ -374,16 +319,19 @@ impl App {
                     let _ = child.wait();
                 });
 
-                self.log_ok("scrcpy lanzado");
+                self.log_ok(self.tr("scrcpy lanzado", "scrcpy launched"));
             }
-            Err(e) => self.log_err(format!("Error lanzando scrcpy: {e}")),
+            Err(e) => self.log_err(format!(
+                "{}: {e}",
+                self.tr("Error lanzando scrcpy", "Error launching scrcpy")
+            )),
         }
     }
 
     pub fn connect_manual(&mut self) {
         let target = self.manual_ip.trim().to_string();
         if target.is_empty() {
-            self.log_err("No se ingresó dirección");
+            self.log_err(self.tr("No se ingresó dirección", "No address entered"));
             return;
         }
 
@@ -393,13 +341,19 @@ impl App {
             format!("{}:{}", target, self.port)
         };
 
-        self.log(format!("Conectando a {full_target}..."));
+        self.log(format!(
+            "{} {full_target}...",
+            self.tr("Conectando a", "Connecting to")
+        ));
         match self.adb_client.connect_to(&full_target) {
             Ok(()) => {
-                self.log_ok("Conectado");
+                self.log_ok(self.tr("Conectado", "Connected"));
                 self.refresh_devices();
             }
-            Err(e) => self.log_err(format!("Error conectando: {e}")),
+            Err(e) => self.log_err(format!(
+                "{}: {e}",
+                self.tr("Error conectando", "Error connecting")
+            )),
         }
     }
 
@@ -426,7 +380,7 @@ impl App {
         self.log(format!(
             "Max size: {}",
             if self.quality.max_size == 0 {
-                "sin límite".to_string()
+                self.tr("sin límite", "no limit").to_string()
             } else {
                 self.quality.max_size.to_string()
             }
@@ -460,17 +414,23 @@ impl App {
 
     pub fn disconnect_selected(&mut self) {
         let Some(serial) = self.selected_info().map(|d| d.serial.clone()) else {
-            self.log_err("No hay dispositivo seleccionado");
+            self.log_err(self.tr("No hay dispositivo seleccionado", "No device selected"));
             return;
         };
 
-        self.log(format!("Desconectando {serial}..."));
+        self.log(format!(
+            "{} {serial}...",
+            self.tr("Desconectando", "Disconnecting")
+        ));
         match self.adb_client.disconnect_from(&serial) {
             Ok(()) => {
-                self.log_ok("Desconectado");
+                self.log_ok(self.tr("Desconectado", "Disconnected"));
                 self.refresh_devices();
             }
-            Err(e) => self.log_err(format!("Error desconectando {serial}: {e}")),
+            Err(e) => self.log_err(format!(
+                "{} {serial}: {e}",
+                self.tr("Error desconectando", "Error disconnecting")
+            )),
         }
     }
 
@@ -478,169 +438,12 @@ impl App {
     pub fn refresh_tool_checks(&mut self) {
         self.adb_available = self.adb_client.check_adb().is_ok();
         self.scrcpy_available = check_scrcpy();
-    }
-
-    // ── Camera methods ──────────────────────────────────────────────
-
-    /// Refresh the camera list from `scrcpy -s SERIAL --list-cameras`.
-    pub fn refresh_cameras(&mut self) {
-        let Some(serial) = self.selected_info().map(|d| d.serial.clone()) else {
-            self.log_err("No hay dispositivo seleccionado");
-            return;
-        };
-
-        self.log("Obteniendo cámaras...");
-        let output = match std::process::Command::new("scrcpy")
-            .args(["-s", &serial, "--list-cameras"])
-            .output()
-        {
-            Ok(o) => o,
-            Err(e) => {
-                self.log_err(format!("Error ejecutando scrcpy --list-cameras: {e}"));
-                return;
-            }
-        };
-
-        let text = String::from_utf8_lossy(&output.stdout);
-        let cameras = parse_camera_list(&text);
-
-        if cameras.is_empty() {
-            self.log_err("No se encontraron cámaras");
-            return;
-        }
-
-        self.camera.available = cameras;
-        self.camera.selected_camera = 0;
-        self.camera.selected_size = 0;
-        self.log_ok(format!("{} cámaras encontradas", self.camera.available.len()));
-    }
-
-    /// Select a camera by index in the available list.
-    pub fn select_camera(&mut self, idx: usize) {
-        if idx < self.camera.available.len() {
-            self.camera.selected_camera = idx;
-            self.camera.selected_size = 0;
-        }
-    }
-
-    /// Select a camera size preset by index.
-    pub fn select_camera_size(&mut self, idx: usize) {
-        let presets = self.camera.size_presets();
-        if idx < presets.len() {
-            self.camera.selected_size = idx;
-            self.log(format!("Tamaño cámara: {}", presets[idx]));
-        }
-    }
-
-    /// Cycle between h264 and h265.
-    pub fn cycle_camera_codec(&mut self) {
-        if self.camera.video_codec == "h264" {
-            self.camera.video_codec = "h265".to_string();
-        } else {
-            self.camera.video_codec = "h264".to_string();
-        }
-        self.log(format!("Codec: {}", self.camera.video_codec));
-    }
-
-    /// Toggle the no-window flag.
-    pub fn toggle_camera_no_window(&mut self) {
-        self.camera.no_window = !self.camera.no_window;
-        self.log(if self.camera.no_window {
-            "Sin ventana: ON".to_string()
-        } else {
-            "Sin ventana: OFF".to_string()
-        });
+        self.v4l2_available = Path::new("/dev/video0").exists();
     }
 
     /// Toggle logs modal.
     pub fn toggle_logs(&mut self) {
         self.show_logs = !self.show_logs;
-    }
-
-    /// Build and return the preview of the scrcpy camera command.
-    pub fn camera_command_preview(&self) -> String {
-        let Some(serial) = self.selected_info().map(|d| d.serial.as_str()) else {
-            return String::new();
-        };
-
-        let mut lines = vec![
-            format!("scrcpy -s {serial}"),
-            "    --video-source=camera".to_string(),
-        ];
-        if let Some(cam) = self.camera.selected_camera_info() {
-            lines.push(format!("    --camera-id={}", cam.id));
-        }
-        lines.push(format!("    --camera-size={}", self.camera.current_size()));
-        lines.push(format!("    --camera-zoom={}", self.camera.camera_zoom));
-        lines.push(format!("    --camera-fps={}", self.camera.camera_fps));
-        lines.push(format!("    --video-codec={}", self.camera.video_codec));
-        lines.push(format!("    --v4l2-sink={}", self.camera.v4l2_sink));
-        if self.camera.no_window {
-            lines.push("    --no-window".to_string());
-        }
-        lines.join("\n")
-    }
-
-    /// Launch scrcpy with camera source settings.
-    pub fn launch_camera_scrcpy(&mut self) {
-        let Some(serial) = self.selected_info().map(|d| d.serial.clone()) else {
-            self.log_err("No hay dispositivo seleccionado");
-            return;
-        };
-
-        self.log("Lanzando scrcpy-cámara...");
-        let mut cmd = std::process::Command::new("scrcpy");
-        cmd.args(["-s", &serial, "--video-source=camera"]);
-        if let Some(cam) = self.camera.selected_camera_info() {
-            cmd.args(["--camera-id", &cam.id]);
-        }
-        cmd.args([
-            "--camera-size",
-            &self.camera.current_size(),
-            "--camera-zoom",
-            &self.camera.camera_zoom,
-            "--camera-fps",
-            &self.camera.camera_fps,
-            "--video-codec",
-            &self.camera.video_codec,
-            "--v4l2-sink",
-            &self.camera.v4l2_sink,
-        ]);
-        if self.camera.no_window {
-            cmd.arg("--no-window");
-        }
-        cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::piped());
-
-        match cmd.spawn() {
-            Ok(mut child) => {
-                let Some(stderr) = child.stderr.take() else {
-                    self.log_err("No se pudo capturar stderr de scrcpy");
-                    return;
-                };
-                let (tx, rx) = mpsc::channel();
-                self.scrcpy_rx = Some(rx);
-
-                std::thread::spawn(move || {
-                    use std::io::BufRead;
-                    let reader = std::io::BufReader::new(stderr);
-                    for line in reader.lines() {
-                        match line {
-                            Ok(msg) => {
-                                if tx.send(msg).is_err() {
-                                    break;
-                                }
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    let _ = child.wait();
-                });
-
-                self.log_ok("scrcpy-cámara lanzado");
-            }
-            Err(e) => self.log_err(format!("Error lanzando scrcpy-cámara: {e}")),
-        }
     }
 }
 
@@ -656,24 +459,7 @@ pub fn check_scrcpy() -> bool {
 ///
 /// Expected line format:
 ///     --camera-id=0    (back, 4000x3000, fps={10, 15, 20}, zoom-range=[1, 10])
-pub fn parse_camera_list(output: &str) -> Vec<CameraInfo> {
-    output
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            let rest = line.strip_prefix("--camera-id=")?;
-            let (id, rest) = rest.split_once(|c: char| c.is_whitespace())?;
-            let inner = rest.trim().strip_prefix('(')?;
-            let (name, rest) = inner.split_once(", ")?;
-            let resolution = rest.split(", ").next()?;
-            Some(CameraInfo {
-                id: id.to_string(),
-                name: name.to_string(),
-                max_resolution: resolution.to_string(),
-            })
-        })
-        .collect()
-}
+
 
 #[cfg(test)]
 mod tests {
@@ -727,8 +513,8 @@ mod tests {
     fn test_log_ok_err() {
         let mut app = make_app(vec![]);
         let initial = app.logs.len();
-        app.log_ok("exitoso");
-        app.log_err("fallo");
+        app.log_ok("success");
+        app.log_err("failure");
         assert!(app.logs[initial].starts_with("\u{f00c}"));
         assert!(app.logs[initial + 1].starts_with("\u{f00d}"));
     }
@@ -819,7 +605,7 @@ mod tests {
     fn test_disconnect_no_device() {
         let mut app = make_app(vec![]);
         app.disconnect_selected();
-        assert!(app.logs.last().unwrap().contains("No hay dispositivo"));
+        assert!(app.logs.last().unwrap().contains("No device selected"));
     }
 
     #[test]
@@ -827,14 +613,14 @@ mod tests {
         let mut app = make_app(vec![]);
         app.make_wireless();
         assert_eq!(app.wireless_state, WirelessState::Idle);
-        assert!(app.logs.last().unwrap().contains("No hay dispositivo"));
+        assert!(app.logs.last().unwrap().contains("No device selected"));
     }
 
     #[test]
     fn test_make_wireless_already_wifi() {
         let mut app = make_app(vec!["192.168.1.1:5555".to_string()]);
         app.make_wireless();
-        assert!(app.logs.last().unwrap().contains("ya está en modo WiFi"));
+        assert!(app.logs.last().unwrap().contains("already in WiFi mode"));
     }
 
     #[test]
@@ -871,7 +657,7 @@ mod tests {
         app.tick_wireless();
 
         assert_eq!(app.wireless_state, WirelessState::Idle);
-        assert!(app.logs.iter().any(|l| l.contains("Conectado por WiFi")));
+        assert!(app.logs.iter().any(|l| l.contains("Connected via WiFi")));
     }
 
     #[test]
@@ -889,7 +675,7 @@ mod tests {
         app.tick_wireless();
 
         assert_eq!(app.wireless_state, WirelessState::Idle);
-        assert!(app.logs.iter().any(|l| l.contains("No se pudo obtener IP")));
+        assert!(app.logs.iter().any(|l| l.contains("Could not get IP")));
     }
 
     #[test]
@@ -900,8 +686,8 @@ mod tests {
 
         app.connect_selected();
         assert!(app.logs.iter().any(|l| {
-            l.contains("scrcpy lanzado")
-                || l.contains("scrcpy")
+            l.contains("scrcpy launched")
+                || l.contains("scrcpy lanzado")
         }));
     }
 
@@ -1025,5 +811,19 @@ INFO: ADB device found:
         assert!(app.camera_command_preview().is_empty());
     }
 
+    #[test]
+    fn test_lang_default() {
+        let app = make_app(vec![]);
+        assert_eq!(app.lang, Lang::En);
+    }
 
+    #[test]
+    fn test_toggle_lang() {
+        let mut app = make_app(vec![]);
+        assert_eq!(app.lang, Lang::En);
+        app.toggle_lang();
+        assert_eq!(app.lang, Lang::Es);
+        app.toggle_lang();
+        assert_eq!(app.lang, Lang::En);
+    }
 }
