@@ -1,3 +1,4 @@
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::sync::mpsc;
 use std::time::Instant;
@@ -293,6 +294,7 @@ impl App {
         cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::piped());
+        cmd.process_group(0);
 
         match cmd.spawn() {
             Ok(mut child) => {

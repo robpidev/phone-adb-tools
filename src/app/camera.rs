@@ -1,3 +1,4 @@
+use std::os::unix::process::CommandExt;
 use std::sync::mpsc;
 
 use crate::types::CameraInfo;
@@ -145,6 +146,7 @@ impl App {
         }
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::piped());
+        cmd.process_group(0);
 
         match cmd.spawn() {
             Ok(mut child) => {
