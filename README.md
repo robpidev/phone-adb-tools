@@ -15,8 +15,8 @@ Prebuilt Linux binary in the GitHub releases:
 `https://github.com/robpidev/phone-adb-tools/releases`
 
 ```bash
-chmod +x phone-tools-linux-x86_64
-./phone-tools-linux-x86_64
+chmod +x phone-tools
+./phone-tools
 ```
 
 Alternative from source (requires Rust 1.85+):
@@ -106,8 +106,8 @@ Binario precompilado para Linux en los releases de GitHub:
 `https://github.com/robpidev/phone-adb-tools/releases`
 
 ```bash
-chmod +x phone-tools-linux-x86_64
-./phone-tools-linux-x86_64
+chmod +x phone-tools
+./phone-tools
 ```
 
 Alternativa desde fuente (requiere Rust 1.85+):
