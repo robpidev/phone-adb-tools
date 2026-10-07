@@ -1,4 +1,4 @@
-# adb-scrcpy-tui
+# phone-tools
 
 Rust edition 2024, requires Rust 1.85+.
 
